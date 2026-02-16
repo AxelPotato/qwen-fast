@@ -6,15 +6,20 @@ import shutil
 import os
 import asyncio
 import uuid
+import httpx
+import ulid
 from typing import List, Optional, Dict
 
 from engine import QwenTTSEngine
+from video_concat import concat_videos, merge_video_audio
 
 # -- Configuration --
-VOICE_DIR = "/app/voices"
-OUTPUT_DIR = "/app/output"
+VOICE_DIR = "/voices"
+OUTPUT_DIR = "/output"
+FINAL_OUTPUT_DIR = "/final_outputs"
 os.makedirs(VOICE_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(FINAL_OUTPUT_DIR, exist_ok=True)
 
 # -- Security Configuration --
 API_KEY_NAME = "x-api-key"
@@ -68,11 +73,40 @@ class TaskStatus(BaseModel):
     task_id: str
     status: str
     download_url: Optional[str] = None
+    file_path: Optional[str] = None
     error: Optional[str] = None
 
 class VoiceMetadata(BaseModel):
     voice_id: str
     filename: str
+    size_bytes: int
+
+class VideoDownloadRequest(BaseModel):
+    url: str
+    project_folder: str
+
+class VideoDownloadResponse(BaseModel):
+    status: str
+    filename: str
+    file_path: str
+    size_bytes: int
+
+class VideoConcatRequest(BaseModel):
+    project_folder: str
+
+class VideoConcatResponse(BaseModel):
+    status: str
+    file_path: str
+    size_bytes: int
+
+class MergeVideoAudioRequest(BaseModel):
+    video_path: str
+    audio_path: str
+
+class MergeVideoAudioResponse(BaseModel):
+    status: str
+    file_path: str
+    download_url: str
     size_bytes: int
 
 # -- Background Worker --
@@ -164,6 +198,7 @@ async def get_task_status(task_id: str):
     
     if job["status"] == "completed":
         response.download_url = f"/download/{task_id}"
+        response.file_path = os.path.join(OUTPUT_DIR, job["filename"])
         
     return response
 
@@ -242,3 +277,96 @@ async def delete_voice_sample(voice_id: str):
         return {"status": "deleted", "voice_id": voice_id}
     
     raise HTTPException(status_code=404, detail="Voice ID not found")
+
+@app.post("/videos/download", response_model=VideoDownloadResponse, dependencies=[Depends(get_api_key)])
+async def download_video(req: VideoDownloadRequest):
+    """Downloads a video file from a URL into the specified project folder."""
+    project_path = os.path.join(OUTPUT_DIR, req.project_folder)
+    os.makedirs(project_path, exist_ok=True)
+
+    # Extract filename from URL, fallback to ulid
+    url_filename = req.url.rsplit("/", 1)[-1].split("?")[0]
+    if not url_filename or "." not in url_filename:
+        url_filename = f"{ulid.new()}.mp4"
+
+    file_path = os.path.join(project_path, url_filename)
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            response = await client.get(req.url)
+            response.raise_for_status()
+
+            with open(file_path, "wb") as f:
+                f.write(response.content)
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Remote server returned {e.response.status_code}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Download failed: {str(e)}")
+
+    return VideoDownloadResponse(
+        status="downloaded",
+        filename=url_filename,
+        file_path=file_path,
+        size_bytes=os.path.getsize(file_path)
+    )
+
+@app.post("/videos/concat", response_model=VideoConcatResponse, dependencies=[Depends(get_api_key)])
+async def concat_video_endpoint(req: VideoConcatRequest):
+    """Concatenates all video files in a project folder into one."""
+    project_path = os.path.join(OUTPUT_DIR, req.project_folder)
+
+    if not os.path.isdir(project_path):
+        raise HTTPException(status_code=404, detail="Project folder not found")
+
+    output_path = os.path.join(OUTPUT_DIR, f"{req.project_folder}_final.mp4")
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, concat_videos, project_path, output_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Concat failed: {str(e)}")
+
+    return VideoConcatResponse(
+        status="completed",
+        file_path=output_path,
+        size_bytes=os.path.getsize(output_path)
+    )
+
+@app.post("/videos/merge", response_model=MergeVideoAudioResponse, dependencies=[Depends(get_api_key)])
+async def merge_video_audio_endpoint(req: MergeVideoAudioRequest):
+    """Merges a video and audio file. Video duration matches the audio. Output goes to final_outputs."""
+    if not os.path.isfile(req.video_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    if not os.path.isfile(req.audio_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+
+    filename = f"{ulid.new()}.mp4"
+    output_path = os.path.join(FINAL_OUTPUT_DIR, filename)
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, merge_video_audio, req.video_path, req.audio_path, output_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Merge failed: {str(e)}")
+
+    return MergeVideoAudioResponse(
+        status="completed",
+        file_path=output_path,
+        download_url=f"/final/{filename}",
+        size_bytes=os.path.getsize(output_path)
+    )
+
+@app.get("/final/{filename}", dependencies=[Depends(get_api_key)])
+async def download_final_video(filename: str):
+    """Downloads a file from final_outputs."""
+    file_path = os.path.join(FINAL_OUTPUT_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(
+        path=file_path,
+        media_type="video/mp4",
+        filename=filename
+    )
