@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  qwen-tts-api:
+    build: .
+    container_name: qwen3-tts-service
+    ports:
+      - "8000:8000"
+    volumes:
+      -./data/voices:/app/voices
+      -./data/output:/app/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
