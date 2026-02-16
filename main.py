@@ -132,7 +132,7 @@ async def process_generation_task(task_id: str, text: str, voice_id: str, langua
             JOBS[task_id]["status"] = "processing"
             
             # Run blocking inference in threadpool
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             output_filename = await loop.run_in_executor(
                 None,
                 tts_engine.clone_voice,
@@ -228,9 +228,11 @@ async def download_audio_endpoint(task_id: str):
 @app.post("/voices/upload", response_model=VoiceMetadata, dependencies=[Depends(get_api_key)])
 async def upload_voice_sample(file: UploadFile = File(...)):
     """Uploads a voice sample for cloning."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename is required")
     if not file.filename.lower().endswith(('.wav', '.mp3', '.flac', '.m4a')):
         raise HTTPException(status_code=400, detail="Unsupported audio format")
-    
+
     voice_id = str(uuid.uuid4())
     extension = os.path.splitext(file.filename)[1]
     safe_filename = f"{voice_id}{extension}"
@@ -284,10 +286,12 @@ async def download_video(req: VideoDownloadRequest):
     project_path = os.path.join(OUTPUT_DIR, req.project_folder)
     os.makedirs(project_path, exist_ok=True)
 
-    # Extract filename from URL, fallback to ulid
-    url_filename = req.url.rsplit("/", 1)[-1].split("?")[0]
-    if not url_filename or "." not in url_filename:
+    # Prefix with ULID to prevent overwrites and ensure correct sort order
+    url_basename = req.url.rsplit("/", 1)[-1].split("?")[0]
+    if not url_basename or "." not in url_basename:
         url_filename = f"{ulid.new()}.mp4"
+    else:
+        url_filename = f"{ulid.new()}_{url_basename}"
 
     file_path = os.path.join(project_path, url_filename)
 
@@ -321,7 +325,7 @@ async def concat_video_endpoint(req: VideoConcatRequest):
     output_path = os.path.join(OUTPUT_DIR, f"{req.project_folder}_final.mp4")
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, concat_videos, project_path, output_path)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -346,7 +350,7 @@ async def merge_video_audio_endpoint(req: MergeVideoAudioRequest):
     output_path = os.path.join(FINAL_OUTPUT_DIR, filename)
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, merge_video_audio, req.video_path, req.audio_path, output_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Merge failed: {str(e)}")
